@@ -6,6 +6,7 @@ private let logger = Logger(subsystem: "com.makmak.MakLock", category: "Watch")
 
 private func watchLog(_ message: String) {
     logger.info("\(message, privacy: .public)")
+    NSLog("[MakLock-Watch] %@", message)
     #if DEBUG
     let line = "[\(Date())] \(message)\n"
     let path = "/tmp/maklock-watch.log"
@@ -25,6 +26,8 @@ private func watchLog(_ message: String) {
 /// - **Connection** to the paired Watch for reliable RSSI polling.
 /// - **Background scanning** with `allowDuplicates` to detect Apple Continuity
 ///   "Nearby Info" packets, which reveal whether the Watch is on-wrist (unlocked).
+/// - **Scan-based RSSI fallback** when connection drops — uses RSSI from discovery
+///   callbacks to maintain proximity awareness without an active connection.
 ///
 /// When the paired Watch moves out of range or is taken off wrist,
 /// the system triggers a lock. When it returns in range, auto-unlock fires.
@@ -77,6 +80,15 @@ final class WatchProximityService: NSObject, ObservableObject {
     private var pairedPeripheral: CBPeripheral?
     private var rssiTimer: Timer?
 
+    /// Periodic health check timer — reconnects if connection was silently lost.
+    private var healthCheckTimer: Timer?
+
+    /// Reconnection backoff state.
+    private var reconnectTimer: Timer?
+    private var reconnectAttempts = 0
+    private static let maxReconnectDelay: TimeInterval = 30
+    private static let baseReconnectDelay: TimeInterval = 1
+
     /// Number of consecutive out-of-range RSSI readings before triggering.
     private let outOfRangeCount = 3
     private var consecutiveOutOfRange = 0
@@ -85,6 +97,9 @@ final class WatchProximityService: NSObject, ObservableObject {
     /// Prevents flapping from occasional noisy BLE packets.
     private let lockedReadingsRequired = 5
     private var consecutiveLockedReadings = 0
+
+    /// Timestamp of last RSSI reading (connection or scan-based).
+    private var lastRSSITime: Date?
 
     private override init() {
         super.init()
@@ -104,6 +119,7 @@ final class WatchProximityService: NSObject, ObservableObject {
         guard !isScanning else { return }
         centralManager = CBCentralManager(delegate: self, queue: nil)
         isScanning = true
+        startHealthCheck()
         watchLog("Watch proximity scanning started")
     }
 
@@ -111,6 +127,11 @@ final class WatchProximityService: NSObject, ObservableObject {
     func stopScanning() {
         rssiTimer?.invalidate()
         rssiTimer = nil
+        healthCheckTimer?.invalidate()
+        healthCheckTimer = nil
+        reconnectTimer?.invalidate()
+        reconnectTimer = nil
+        reconnectAttempts = 0
         centralManager?.stopScan()
         centralManager = nil
         pairedPeripheral = nil
@@ -119,6 +140,7 @@ final class WatchProximityService: NSObject, ObservableObject {
         isWatchUnlocked = nil
         consecutiveOutOfRange = 0
         consecutiveLockedReadings = 0
+        lastRSSITime = nil
         watchLog("Watch proximity scanning stopped")
     }
 
@@ -134,16 +156,93 @@ final class WatchProximityService: NSObject, ObservableObject {
 
     private func startRSSIPolling() {
         rssiTimer?.invalidate()
-        rssiTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+        rssiTimer = Timer(timeInterval: 5.0, repeats: true) { [weak self] _ in
             self?.pairedPeripheral?.readRSSI()
+        }
+        // Use .common mode so polling continues during modal dialogs
+        RunLoop.main.add(rssiTimer!, forMode: .common)
+    }
+
+    /// Periodic health check: if connection silently dropped, attempt reconnect.
+    private func startHealthCheck() {
+        healthCheckTimer?.invalidate()
+        healthCheckTimer = Timer(timeInterval: 15.0, repeats: true) { [weak self] _ in
+            self?.performHealthCheck()
+        }
+        RunLoop.main.add(healthCheckTimer!, forMode: .common)
+    }
+
+    private func performHealthCheck() {
+        guard centralManager?.state == .poweredOn else { return }
+        guard pairedWatchIdentifier != nil else { return }
+
+        // If we have a connected peripheral, everything is fine
+        if let peripheral = pairedPeripheral, peripheral.state == .connected {
+            return
+        }
+
+        // Connection lost or never established — attempt reconnect
+        // But only if no reconnect is already scheduled (avoid resetting backoff)
+        if reconnectTimer == nil {
+            watchLog("Health check: no active connection, attempting reconnect")
+            attemptReconnect()
+        }
+
+        // If no RSSI reading in 20s and we think we're in range, start treating
+        // scan-based RSSI as stale and let out-of-range logic kick in
+        if isWatchInRange, let last = lastRSSITime, Date().timeIntervalSince(last) > 20 {
+            watchLog("Health check: no RSSI for 20s while in-range, incrementing out-of-range")
+            consecutiveOutOfRange += 1
+            if consecutiveOutOfRange >= outOfRangeCount {
+                isWatchInRange = false
+                watchLog("Health check: Watch marked OUT OF RANGE (stale RSSI)")
+                onWatchOutOfRange?()
+            }
         }
     }
 
+    /// Attempt to reconnect to the paired Watch with exponential backoff.
+    private func attemptReconnect() {
+        guard let central = centralManager, central.state == .poweredOn else { return }
+        guard let watchID = pairedWatchIdentifier else { return }
+
+        // Cancel any pending reconnect timer
+        reconnectTimer?.invalidate()
+        reconnectTimer = nil
+
+        // Try retrievePeripherals first (most reliable after disconnect)
+        let peripherals = central.retrievePeripherals(withIdentifiers: [watchID])
+        if let peripheral = peripherals.first {
+            pairedPeripheral = peripheral
+            peripheral.delegate = self
+            central.connect(peripheral)
+            watchLog("Reconnect attempt #\(reconnectAttempts + 1): connecting to \(watchID.uuidString)")
+        } else {
+            watchLog("Reconnect: peripheral not found via retrievePeripherals, relying on scan")
+            // Clear pairedPeripheral so didDiscover can re-establish it
+            pairedPeripheral = nil
+        }
+    }
+
+    /// Schedule a reconnect with exponential backoff.
+    private func scheduleReconnect() {
+        reconnectTimer?.invalidate()
+        let delay = min(
+            Self.baseReconnectDelay * pow(2.0, Double(reconnectAttempts)),
+            Self.maxReconnectDelay
+        )
+        reconnectAttempts += 1
+        watchLog("Scheduling reconnect in \(delay)s (attempt #\(reconnectAttempts))")
+
+        reconnectTimer = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
+            self?.attemptReconnect()
+        }
+        RunLoop.main.add(reconnectTimer!, forMode: .common)
+    }
+
     private func handleRSSI(_ rssi: Int) {
-        // RSSI-only proximity detection.
-        // Lock state (on-wrist) is checked separately in AppDelegate when deciding
-        // whether to auto-unlock. Taking the Watch off does NOT re-lock already open apps —
-        // it only prevents future auto-unlocks (requiring Touch ID instead).
+        lastRSSITime = Date()
+
         if rssi < rssiThreshold {
             consecutiveOutOfRange += 1
             if consecutiveOutOfRange >= outOfRangeCount && isWatchInRange {
@@ -225,6 +324,9 @@ extension WatchProximityService: CBCentralManagerDelegate {
             return
         }
 
+        // Reset reconnect backoff on fresh Bluetooth power-on
+        reconnectAttempts = 0
+
         // If we have a paired Watch, try to reconnect
         if let watchID = pairedWatchIdentifier {
             let peripherals = central.retrievePeripherals(withIdentifiers: [watchID])
@@ -252,22 +354,39 @@ extension WatchProximityService: CBCentralManagerDelegate {
         let advName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
         let name = peripheralName ?? advName
 
-        // --- Nearby Info detection: check lock state from Continuity advertisement ---
-        if peripheral.identifier == pairedWatchIdentifier,
-           let lockState = parseNearbyInfoLockState(from: advertisementData) {
+        // --- Nearby Info detection: check lock state from Continuity packets ---
+        // Apple Watch rotates BLE addresses for privacy, so Nearby Info may arrive
+        // from a different UUID than the paired one.
+        // Strategy: Accept "unlocked" from any Apple device (safe — if ANY nearby device
+        // reports unlocked, Watch is likely on wrist). Only accept "locked" from the
+        // paired Watch UUID to avoid false locks from other devices (iPhone, Mac, etc.).
+        if let lockState = parseNearbyInfoLockState(from: advertisementData) {
+            let isPairedDevice = peripheral.identifier == pairedWatchIdentifier
             if lockState {
-                // Unlocked → accept immediately (user put Watch back on)
+                // Unlocked → accept from any device (safe direction)
                 consecutiveLockedReadings = 0
                 if isWatchUnlocked != true {
-                    watchLog("Watch lock state changed: unlocked=true")
+                    watchLog("Watch lock state changed: unlocked=true (from peripheral: \(peripheral.identifier.uuidString), paired: \(isPairedDevice))")
                     isWatchUnlocked = true
                 }
-            } else {
-                // Locked → require multiple consecutive readings to avoid flapping
+            } else if isPairedDevice {
+                // Locked → only trust from paired Watch UUID to avoid false locks
                 consecutiveLockedReadings += 1
                 if consecutiveLockedReadings >= lockedReadingsRequired && isWatchUnlocked != false {
                     watchLog("Watch lock state changed: unlocked=false (after \(consecutiveLockedReadings) readings)")
                     isWatchUnlocked = false
+                }
+            }
+        }
+
+        // --- Scan-based RSSI fallback for paired Watch ---
+        // When connection is lost, use RSSI from scan packets to maintain proximity awareness.
+        if peripheral.identifier == pairedWatchIdentifier {
+            let rssiValue = RSSI.intValue
+            // Only use scan RSSI if we don't have an active connection (avoid double-counting)
+            if pairedPeripheral == nil || pairedPeripheral?.state != .connected {
+                if rssiValue != 127 { // 127 = RSSI unavailable
+                    handleRSSI(rssiValue)
                 }
             }
         }
@@ -294,6 +413,8 @@ extension WatchProximityService: CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         watchLog("Connected to Watch: \(peripheral.identifier.uuidString) (name: \(peripheral.name ?? "nil"))")
+        // Reset reconnect backoff on successful connection
+        reconnectAttempts = 0
         // Don't set isWatchInRange here — let handleRSSI determine it
         // based on both RSSI threshold AND lock state from Nearby Info.
         startRSSIPolling()
@@ -301,19 +422,26 @@ extension WatchProximityService: CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         watchLog("Failed to connect: \(peripheral.identifier.uuidString) error: \(error?.localizedDescription ?? "nil")")
+        pairedPeripheral = nil
+        // Retry with exponential backoff
+        scheduleReconnect()
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         watchLog("Watch disconnected (error: \(error?.localizedDescription ?? "none"))")
-        isWatchInRange = false
-        isWatchUnlocked = nil
         pairedPeripheral = nil
         rssiTimer?.invalidate()
         rssiTimer = nil
-        onWatchOutOfRange?()
 
-        // Try to reconnect
-        central.connect(peripheral)
+        // Don't immediately mark out of range — scan-based RSSI will continue
+        // providing proximity data. Only fire out-of-range if scan RSSI also drops.
+        // Keep last known lock state — clearing to nil would default to "unlocked"
+        // via (isWatchUnlocked ?? true) in AppDelegate, which is less safe than
+        // keeping the last known value.
+
+        // Retry connection with exponential backoff
+        reconnectAttempts = 0 // Fresh disconnect, start backoff from 1s
+        scheduleReconnect()
     }
 }
 
