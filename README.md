@@ -15,7 +15,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-white?style=flat-square" alt="License"></a>
   <a href="https://github.com/dutkiewiczmaciej/MakLock/stargazers"><img src="https://img.shields.io/github/stars/dutkiewiczmaciej/MakLock?style=flat-square&color=FFD213" alt="Stars"></a>
   <a href="https://github.com/dutkiewiczmaciej/MakLock/releases/latest"><img src="https://img.shields.io/github/v/release/dutkiewiczmaciej/MakLock?style=flat-square&label=release" alt="Release"></a>
-  <a href="https://github.com/dutkiewiczmaciej/MakLock/releases"><img src="https://img.shields.io/github/downloads/dutkiewiczmaciej/MakLock/total?style=flat-square&color=34C759&label=downloads" alt="Downloads"></a>
+  <a href="https://github.com/dutkiewiczmaciej/MakLock/releases"><img src="https://img.shields.io/github/downloads/dutkiewiczmaciej/MakLock/total?style=flat-square&color=34C759&label=downloads&v=2" alt="Downloads"></a>
 </p>
 
 ---
