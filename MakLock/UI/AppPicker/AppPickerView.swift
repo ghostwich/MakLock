@@ -196,6 +196,10 @@ private struct AppPickerRow: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(app.name)
                         .font(MakLockTypography.headline)
+                    Text(app.path)
+                        .font(MakLockTypography.caption)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
                     Text(app.bundleIdentifier)
                         .font(MakLockTypography.caption)
                         .foregroundColor(.secondary)
