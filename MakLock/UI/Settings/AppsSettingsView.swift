@@ -53,6 +53,9 @@ struct AppsSettingsView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(app.name)
                             .font(MakLockTypography.headline)
+                        Text(app.path)
+                            .font(MakLockTypography.caption)
+                            .foregroundColor(.secondary)
                         Text(app.bundleIdentifier)
                             .font(MakLockTypography.caption)
                             .foregroundColor(.secondary)
