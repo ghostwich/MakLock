@@ -102,7 +102,7 @@ struct AppPickerView: View {
 
     private func loadInstalledApps() {
         let fileManager = FileManager.default
-        let appDirs = ["/Applications", "/System/Applications", FileManager.default.homeDirectoryForCurrentUser.path() + "Applications"]
+        let appDirs = ["/Applications", "/System/Applications", FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications").path()]
         var apps: [AppInfo] = []
 
         let alreadyProtected = Set(Defaults.shared.protectedApps.map(\.bundleIdentifier))
@@ -197,10 +197,6 @@ private struct AppPickerRow: View {
                     Text(app.name)
                         .font(MakLockTypography.headline)
                     Text(app.path)
-                        .font(MakLockTypography.caption)
-                        .foregroundColor(.secondary)
-                        .lineLimit(1)
-                    Text(app.bundleIdentifier)
                         .font(MakLockTypography.caption)
                         .foregroundColor(.secondary)
                         .lineLimit(1)

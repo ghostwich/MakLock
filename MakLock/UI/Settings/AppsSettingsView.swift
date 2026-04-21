@@ -56,9 +56,6 @@ struct AppsSettingsView: View {
                         Text(app.path)
                             .font(MakLockTypography.caption)
                             .foregroundColor(.secondary)
-                        Text(app.bundleIdentifier)
-                            .font(MakLockTypography.caption)
-                            .foregroundColor(.secondary)
                     }
                     Spacer()
 
